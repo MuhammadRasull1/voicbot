@@ -21,7 +21,7 @@ if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
         "TELEGRAM_BOT_TOKEN и GEMINI_API_KEY."
     )
 
-genai.configure(api_key=GEMINI_API_KEY)
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 MODEL = genai.GenerativeModel("gemini-1.5-flash")
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
