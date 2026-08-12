@@ -2,6 +2,7 @@ import asyncio
 import os
 import threading
 import time
+import traceback
 import uuid
 
 import google.generativeai as genai
@@ -121,6 +122,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await file.download_to_drive(audio_path)
     except Exception as exc:
         print(f"[ошибка скачивания] {exc}")
+        traceback.print_exc()
         await message.reply_text(FRIENDLY_ERROR)
         return
 
@@ -129,6 +131,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text = await asyncio.to_thread(transcribe_audio, audio_path, mime_type)
     except Exception as exc:
         print(f"[ошибка распознавания] {exc}")
+        traceback.print_exc()
         await message.reply_text(FRIENDLY_ERROR)
         return
     finally:
