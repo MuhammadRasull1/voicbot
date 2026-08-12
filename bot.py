@@ -58,8 +58,8 @@ def run_flask() -> None:
     app.run(host="0.0.0.0", port=port)
 
 
-def transcribe_audio(audio_path: str) -> str:
-    uploaded_file = genai.upload_file(audio_path)
+def transcribe_audio(audio_path: str, mime_type: str) -> str:
+    uploaded_file = genai.upload_file(audio_path, mime_type=mime_type)
     response = MODEL.generate_content([uploaded_file, PROMPT])
     return response.text.strip()
 
@@ -96,15 +96,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text(FRIENDLY_ERROR)
         return
 
+    mime_map = {
+        "audio/mpeg": "mp3",
+        "audio/mp4": "m4a",
+        "audio/x-m4a": "m4a",
+        "audio/ogg": "ogg",
+        "audio/wav": "wav",
+    }
     if ext == "audio" and media.mime_type:
-        mime_map = {
-            "audio/mpeg": "mp3",
-            "audio/mp4": "m4a",
-            "audio/x-m4a": "m4a",
-            "audio/ogg": "ogg",
-            "audio/wav": "wav",
-        }
         ext = mime_map.get(media.mime_type, "bin")
+
+    ext_to_mime = {
+        "ogg": "audio/ogg",
+        "mp3": "audio/mpeg",
+        "m4a": "audio/mp4",
+        "wav": "audio/wav",
+    }
+    mime_type = ext_to_mime.get(ext, "audio/ogg")
 
     audio_path = f"/tmp/voice_{uuid.uuid4().hex}.{ext}"
     try:
@@ -117,7 +125,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         await message.reply_text("Распознаю голосовое сообщение…")
-        text = await asyncio.to_thread(transcribe_audio, audio_path)
+        text = await asyncio.to_thread(transcribe_audio, audio_path, mime_type)
     except Exception as exc:
         print(f"[ошибка распознавания] {exc}")
         await message.reply_text(FRIENDLY_ERROR)
