@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+import time
 import uuid
 
 import google.generativeai as genai
@@ -59,8 +60,13 @@ def run_flask() -> None:
 
 
 def transcribe_audio(audio_path: str, mime_type: str) -> str:
-    uploaded_file = genai.upload_file(audio_path, mime_type=mime_type)
-    response = MODEL.generate_content([uploaded_file, PROMPT])
+    file_ref = genai.upload_file(audio_path, mime_type=mime_type)
+    while file_ref.state.name == "PROCESSING":
+        time.sleep(1)
+        file_ref = genai.get_file(file_ref.name)
+    if file_ref.state.name == "FAILED":
+        raise RuntimeError("Gemini не смог обработать файл")
+    response = MODEL.generate_content([file_ref, PROMPT])
     return response.text.strip()
 
 
