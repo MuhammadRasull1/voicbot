@@ -6,7 +6,7 @@ import uuid
 
 import google.generativeai as genai
 from dotenv import load_dotenv
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -52,11 +52,6 @@ def health() -> str:
 @app.route("/health")
 def health_check():
     return jsonify(status="ok")
-
-
-def run_flask() -> None:
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
 
 
 def transcribe_audio(audio_path: str, mime_type: str) -> str:
@@ -154,16 +149,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def main() -> None:
-    threading.Thread(target=run_flask, daemon=True).start()
+app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+app_bot.add_handler(CommandHandler("start", start))
+app_bot.add_handler(
+    MessageHandler(filters.VOICE | filters.AUDIO, handle_voice)
+)
 
-    app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(
-        MessageHandler(filters.VOICE | filters.AUDIO, handle_voice)
+
+@app.route("/webhook", methods=["POST"])
+def webhook() -> tuple[str, int]:
+    data = request.get_json(silent=True)
+    if data is None:
+        return "Invalid JSON", 400
+
+    loop = event_loop
+    if loop is None:
+        return "Bot not ready", 503
+
+    update = Update.de_json(data, app_bot.bot)
+    future = asyncio.run_coroutine_threadsafe(
+        app_bot.process_update(update), loop
     )
-    print("Бот запущен. Нажми Ctrl+C для остановки.")
-    app_bot.run_polling()
+
+    def _log_update_error(fut: asyncio.Future) -> None:
+        if not fut.cancelled() and fut.exception():
+            print(f"[ошибка обработки update] {fut.exception()}")
+
+    future.add_done_callback(_log_update_error)
+    return "OK", 200
+
+
+event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def main() -> None:
+    global event_loop
+    event_loop = asyncio.new_event_loop()
+    threading.Thread(target=event_loop.run_forever, daemon=True).start()
+
+    asyncio.run_coroutine_threadsafe(app_bot.initialize(), event_loop).result()
+    asyncio.run_coroutine_threadsafe(app_bot.start(), event_loop).result()
+
+    webhook_base = os.getenv("WEBHOOK_URL")
+    if webhook_base:
+        webhook_url = webhook_base.rstrip("/") + "/webhook"
+        asyncio.run_coroutine_threadsafe(
+            app_bot.bot.set_webhook(webhook_url), event_loop
+        ).result()
+        print(f"Вебхук установлен: {webhook_url}")
+    else:
+        print("WEBHOOK_URL не задан — вебхук не установлен")
+
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
