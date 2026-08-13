@@ -6,6 +6,12 @@ import traceback
 import uuid
 
 from google import genai
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from telegram import Update
@@ -55,6 +61,21 @@ def health_check():
     return jsonify(status="ok")
 
 
+@retry(
+    reraise=True,
+    retry=retry_if_exception_type(genai.errors.ServerError),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+)
+def _generate_content(file_uri: str, mime_type: str) -> str:
+    content = [
+        genai.types.Part.from_uri(file_uri=file_uri, mime_type=mime_type),
+        PROMPT,
+    ]
+    response = client.models.generate_content(model=MODEL, contents=content)
+    return response.text.strip()
+
+
 def transcribe_audio(audio_path: str, mime_type: str) -> str:
     file_ref = client.files.upload(file=audio_path)
     while file_ref.state == genai.types.FileState.PROCESSING:
@@ -62,12 +83,7 @@ def transcribe_audio(audio_path: str, mime_type: str) -> str:
         file_ref = client.files.get(name=file_ref.name)
     if file_ref.state == genai.types.FileState.FAILED:
         raise RuntimeError("Gemini не смог обработать файл")
-    content = [
-        genai.types.Part.from_uri(file_uri=file_ref.uri, mime_type=mime_type),
-        PROMPT,
-    ]
-    response = client.models.generate_content(model=MODEL, contents=content)
-    return response.text.strip()
+    return _generate_content(file_ref.uri, mime_type)
 
 
 def split_into_messages(text: str) -> list[str]:
@@ -120,9 +136,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     }
     mime_type = ext_to_mime.get(ext, "audio/ogg")
 
+    await message.reply_text("Распознаю голосовое сообщение…")
+    asyncio.create_task(_process_voice(update, media.file_id, ext, mime_type))
+
+
+async def _process_voice(
+    update: Update, file_id: str, ext: str, mime_type: str
+) -> None:
+    message = update.message
     audio_path = f"/tmp/voice_{uuid.uuid4().hex}.{ext}"
     try:
-        file = await context.bot.get_file(media.file_id)
+        file = await message.bot.get_file(file_id)
         await file.download_to_drive(audio_path)
     except Exception as exc:
         print(f"[ошибка скачивания] {exc}")
@@ -131,7 +155,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        await message.reply_text("Распознаю голосовое сообщение…")
         text = await asyncio.to_thread(transcribe_audio, audio_path, mime_type)
     except Exception as exc:
         print(f"[ошибка распознавания] {exc}")
