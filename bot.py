@@ -1,23 +1,25 @@
 import asyncio
+import logging
 import os
+import tempfile
 import threading
-import time
-import traceback
-import uuid
 
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
 from google import genai
+from google.genai import types
+from google.genai.errors import ClientError, ServerError
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
-from dotenv import load_dotenv
-from flask import Flask, jsonify, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -28,12 +30,18 @@ if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
         "TELEGRAM_BOT_TOKEN и GEMINI_API_KEY."
     )
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+client = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"],
+    http_options=types.HttpOptions(timeout=60000),
+)
 MODEL = "gemini-2.5-flash"
+
+logger = logging.getLogger(__name__)
+
+gemini_semaphore = asyncio.Semaphore(2)
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_VOICE_SECONDS = 300
-MAX_MESSAGE_LEN = 4000
 
 FRIENDLY_ERROR = (
     "Ой, голосовое слишком длинное или не получилось разобрать. "
@@ -61,52 +69,108 @@ def health_check():
     return jsonify(status="ok")
 
 
-@retry(
-    reraise=True,
-    retry=retry_if_exception_type(genai.errors.ServerError),
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=60),
-)
-def _generate_content(file_uri: str, mime_type: str) -> str:
-    content = [
-        genai.types.Part.from_uri(file_uri=file_uri, mime_type=mime_type),
-        PROMPT,
-    ]
-    response = client.models.generate_content(model=MODEL, contents=content)
-    return response.text.strip()
+def _should_retry(exception):
+    if isinstance(exception, ServerError):
+        return True
+    if isinstance(exception, ClientError):
+        if exception.code in [400, 401, 403]:
+            return False
+        if exception.code in [429, 408, 503] or exception.code >= 500:
+            return True
+    return False
 
 
-def transcribe_audio(audio_path: str, mime_type: str) -> str:
-    file_ref = client.files.upload(file=audio_path)
-    while file_ref.state == genai.types.FileState.PROCESSING:
-        time.sleep(1)
-        file_ref = client.files.get(name=file_ref.name)
-    if file_ref.state == genai.types.FileState.FAILED:
-        raise RuntimeError("Gemini не смог обработать файл")
-    return _generate_content(file_ref.uri, mime_type)
+AUDIO_MIME_TO_SUFFIX = {
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+}
 
 
-def split_into_messages(text: str) -> list[str]:
-    parts = []
-    while len(text) > MAX_MESSAGE_LEN:
-        cut = text.rfind("\n\n", 0, MAX_MESSAGE_LEN)
-        if cut == -1:
-            cut = text.rfind(" ", 0, MAX_MESSAGE_LEN)
-        if cut == -1:
-            cut = MAX_MESSAGE_LEN
-        parts.append(text[:cut].strip())
-        text = text[cut:].strip()
-    if text:
-        parts.append(text)
-    return parts
+async def _process_voice(
+    message, bot: Bot, file_id: str, suffix: str = ".ogg"
+) -> None:
+    audio_path = None
+    uploaded_name = None
+
+    async with gemini_semaphore:
+        try:
+            file_obj = await bot.get_file(file_id)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                audio_path = tmp.name
+
+            await file_obj.download_to_drive(custom_path=audio_path)
+
+            await message.reply_text("🔄 Обрабатываю голосовое сообщение, подождите...")
+
+            def run_gemini_with_retry():
+                @retry(
+                    stop=stop_after_attempt(4),
+                    wait=wait_exponential(multiplier=2, min=2, max=15),
+                    retry=retry_if_exception_type((ServerError, ClientError)),
+                    reraise=True,
+                )
+                def execute():
+                    nonlocal uploaded_name
+                    uploaded = client.files.upload(file=audio_path)
+                    uploaded_name = uploaded.name
+
+                    response = client.models.generate_content(
+                        model=MODEL,
+                        contents=[PROMPT, uploaded],
+                    )
+                    return response.text
+
+                return execute()
+
+            response_text = await asyncio.to_thread(run_gemini_with_retry)
+
+            if response_text:
+                await send_long_message(message, response_text)
+            else:
+                await message.reply_text(FRIENDLY_ERROR)
+
+        except Exception as e:
+            logger.error(
+                "Критическая ошибка при обработке голосового сообщения: %s", e,
+                exc_info=True,
+            )
+            await message.reply_text(
+                "❌ Извините, не удалось обработать голосовое сообщение из-за "
+                "временной перегрузки серверов. Попробуйте позже."
+            )
+
+        finally:
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception as ex:
+                    logger.warning("Не удалось удалить локальный файл: %s", ex)
+
+            if uploaded_name:
+                try:
+                    await asyncio.to_thread(client.files.delete, name=uploaded_name)
+                except Exception as ex:
+                    logger.warning("Не удалось удалить файл из Gemini API: %s", ex)
+
+
+async def send_long_message(message, text: str) -> None:
+    max_length = 4096
+    for i in range(0, len(text), max_length):
+        chunk = text[i : i + max_length]
+        await message.reply_text(chunk)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
+    message = update.effective_message
     if message.voice is not None:
-        media, ext = message.voice, "ogg"
+        media, suffix = message.voice, ".ogg"
     elif message.audio is not None:
-        media, ext = message.audio, "audio"
+        media = message.audio
+        suffix = AUDIO_MIME_TO_SUFFIX.get(media.mime_type, ".audio")
     else:
         return
 
@@ -118,59 +182,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text(FRIENDLY_ERROR)
         return
 
-    mime_map = {
-        "audio/mpeg": "mp3",
-        "audio/mp4": "m4a",
-        "audio/x-m4a": "m4a",
-        "audio/ogg": "ogg",
-        "audio/wav": "wav",
-    }
-    if ext == "audio" and media.mime_type:
-        ext = mime_map.get(media.mime_type, "bin")
-
-    ext_to_mime = {
-        "ogg": "audio/ogg",
-        "mp3": "audio/mpeg",
-        "m4a": "audio/mp4",
-        "wav": "audio/wav",
-    }
-    mime_type = ext_to_mime.get(ext, "audio/ogg")
-
-    await message.reply_text("Распознаю голосовое сообщение…")
-    asyncio.create_task(_process_voice(update, media.file_id, ext, mime_type))
-
-
-async def _process_voice(
-    update: Update, file_id: str, ext: str, mime_type: str
-) -> None:
-    message = update.message
-    audio_path = f"/tmp/voice_{uuid.uuid4().hex}.{ext}"
-    try:
-        file = await message.bot.get_file(file_id)
-        await file.download_to_drive(audio_path)
-    except Exception as exc:
-        print(f"[ошибка скачивания] {exc}")
-        traceback.print_exc()
-        await message.reply_text(FRIENDLY_ERROR)
-        return
-
-    try:
-        text = await asyncio.to_thread(transcribe_audio, audio_path, mime_type)
-    except Exception as exc:
-        print(f"[ошибка распознавания] {exc}")
-        traceback.print_exc()
-        await message.reply_text(FRIENDLY_ERROR)
-        return
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-    if not text:
-        await message.reply_text(FRIENDLY_ERROR)
-        return
-
-    for part in split_into_messages(text):
-        await message.reply_text(part)
+    asyncio.create_task(
+        _process_voice(
+            message=message,
+            bot=context.bot,
+            file_id=media.file_id,
+            suffix=suffix,
+        )
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
