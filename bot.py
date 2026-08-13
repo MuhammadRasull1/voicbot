@@ -5,7 +5,7 @@ import time
 import traceback
 import uuid
 
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from telegram import Update
@@ -22,8 +22,8 @@ if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
         "TELEGRAM_BOT_TOKEN и GEMINI_API_KEY."
     )
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-MODEL = genai.GenerativeModel("gemini-1.5-flash")
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+MODEL = "gemini-1.5-flash"
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_VOICE_SECONDS = 300
@@ -56,13 +56,17 @@ def health_check():
 
 
 def transcribe_audio(audio_path: str, mime_type: str) -> str:
-    file_ref = genai.upload_file(audio_path, mime_type=mime_type)
-    while file_ref.state.name == "PROCESSING":
+    file_ref = client.files.upload(path=audio_path)
+    while file_ref.state == genai.types.FileState.PROCESSING:
         time.sleep(1)
-        file_ref = genai.get_file(file_ref.name)
-    if file_ref.state.name == "FAILED":
+        file_ref = client.files.get(name=file_ref.name)
+    if file_ref.state == genai.types.FileState.FAILED:
         raise RuntimeError("Gemini не смог обработать файл")
-    response = MODEL.generate_content([file_ref, PROMPT])
+    content = [
+        genai.types.Part.from_uri(file_uri=file_ref.uri, mime_type=mime_type),
+        PROMPT,
+    ]
+    response = client.models.generate_content(model=MODEL, contents=content)
     return response.text.strip()
 
 
