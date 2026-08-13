@@ -56,7 +56,7 @@ def health_check():
 
 
 def transcribe_audio(audio_path: str, mime_type: str) -> str:
-    file_ref = client.files.upload(path=audio_path)
+    file_ref = client.files.upload(file=audio_path, mime_type=mime_type)
     while file_ref.state == genai.types.FileState.PROCESSING:
         time.sleep(1)
         file_ref = client.files.get(name=file_ref.name)
