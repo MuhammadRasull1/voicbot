@@ -23,7 +23,7 @@ if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
     )
 
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-MODEL = "gemini-1.5-flash"
+MODEL = "gemini-2.5-flash"
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_VOICE_SECONDS = 300
